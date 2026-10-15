@@ -1,0 +1,161 @@
+name: TestFlight (personal)
+
+# A personal build of this fork, signed with my own Apple Developer account and
+# uploaded to App Store Connect. It lands in TestFlight for internal testers
+# only: nothing here submits for review or releases on the App Store.
+#
+# Run it by hand from the Actions tab. It needs, in this fork's settings:
+#   Secrets   APPLE_TEAM_ID       10-character Team ID (developer.apple.com > Membership)
+#             ASC_KEY_ID          App Store Connect API key ID
+#             ASC_ISSUER_ID       App Store Connect API issuer ID
+#             ASC_KEY_P8_BASE64   the AuthKey_XXXX.p8 file, base64-encoded
+#   Variable  IOS_BUNDLE_ID       a bundle ID registered on my account
+#
+# The key must have the Admin role: Xcode creates the distribution certificate
+# and the App Store profile itself (cloud-managed signing), so no .p12 or
+# provisioning profile is stored anywhere.
+#
+# Push notifications are off in this build. The upstream Firebase project is
+# theirs, so the app runs on the placeholder config CI uses for forks, and
+# PushService already treats that as "push unavailable".
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: testflight
+  cancel-in-progress: false
+
+jobs:
+  testflight:
+    name: Build and upload to TestFlight
+    runs-on: macos-latest
+    timeout-minutes: 60
+
+    env:
+      BUNDLE_ID: ${{ vars.IOS_BUNDLE_ID }}
+      TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+      ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+      ASC_KEY_PATH: ${{ github.workspace }}/../asc/AuthKey.p8
+
+    steps:
+      - name: Check the signing inputs
+        env:
+          ASC_KEY_P8_BASE64: ${{ secrets.ASC_KEY_P8_BASE64 }}
+        run: |
+          missing=0
+          for name in BUNDLE_ID TEAM_ID ASC_KEY_ID ASC_ISSUER_ID ASC_KEY_P8_BASE64; do
+            if [ -z "${!name}" ]; then
+              echo "::error::$name is not set. See the header of testflight.yml."
+              missing=1
+            fi
+          done
+          exit "$missing"
+
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          # derive_version.sh counts commits for the build number.
+          fetch-depth: 0
+
+      - name: Set up Flutter
+        uses: ./.github/actions/setup-flutter
+        with:
+          swift-package-manager: "false"
+
+      - name: Use the placeholder Firebase config
+        run: |
+          .github/scripts/stub_firebase_config.sh
+          # Runner.xcodeproj copies this file as a resource, so it has to exist.
+          # The app never reads it: Firebase is initialised from the Dart
+          # options, which the stub makes throw.
+          printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' \
+            '<plist version="1.0"><dict/></plist>' > ios/Runner/GoogleService-Info.plist
+
+      - name: Derive the build identity
+        run: .github/scripts/derive_version.sh
+
+      - name: Install build dependencies
+        run: brew install automake libtool
+
+      - name: Retarget the app to my account
+        run: |
+          perl -pi -e '
+            s/^(\s*)PRODUCT_BUNDLE_IDENTIFIER = com\.darkflippers\.qunleashed;/$1DEVELOPMENT_TEAM = $ENV{TEAM_ID};\n$1PRODUCT_BUNDLE_IDENTIFIER = $ENV{BUNDLE_ID};/;
+            s/com\.darkflippers\.qunleashed\.RunnerTests/$ENV{BUNDLE_ID}.RunnerTests/g;
+          ' ios/Runner.xcodeproj/project.pbxproj
+          grep -n "PRODUCT_BUNDLE_IDENTIFIER\|DEVELOPMENT_TEAM" ios/Runner.xcodeproj/project.pbxproj
+
+          # Standard HTTPS/TLS only, which is exempt. Without the key every
+          # build waits in App Store Connect for the export compliance answer.
+          /usr/libexec/PlistBuddy -c "Delete :ITSAppUsesNonExemptEncryption" ios/Runner/Info.plist 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Add :ITSAppUsesNonExemptEncryption bool false" ios/Runner/Info.plist
+
+      - name: Install the App Store Connect key
+        env:
+          ASC_KEY_P8_BASE64: ${{ secrets.ASC_KEY_P8_BASE64 }}
+        run: |
+          mkdir -p "$(dirname "$ASC_KEY_PATH")"
+          printf '%s' "$ASC_KEY_P8_BASE64" | base64 --decode > "$ASC_KEY_PATH"
+          chmod 600 "$ASC_KEY_PATH"
+
+      - name: Generate the Xcode configuration
+        run: |
+          # derive_version.sh numbers a build by its commit count, so running
+          # this twice on one commit would reuse a number TestFlight already
+          # has. The run number keeps every upload distinct and increasing.
+          read -r -a args <<< "$QUNLEASHED_FLUTTER_BUILD_ARGS"
+          for i in "${!args[@]}"; do
+            case "${args[$i]}" in
+              --build-number=*) args[$i]="${args[$i]}.${GITHUB_RUN_NUMBER}" ;;
+            esac
+          done
+          flutter build ios --release --config-only "${args[@]}"
+
+      - name: Archive
+        run: |
+          xcodebuild archive \
+            -workspace ios/Runner.xcworkspace \
+            -scheme Runner \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/Runner.xcarchive" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$ASC_KEY_PATH" \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID"
+
+      - name: Sign and upload to TestFlight
+        run: |
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key><string>app-store-connect</string>
+            <key>destination</key><string>upload</string>
+            <key>teamID</key><string>${TEAM_ID}</string>
+            <key>signingStyle</key><string>automatic</string>
+            <key>manageAppVersionAndBuildNumber</key><false/>
+            <key>uploadSymbols</key><true/>
+            <key>testFlightInternalTestingOnly</key><true/>
+          </dict>
+          </plist>
+          PLIST
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/Runner.xcarchive" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
+            -exportPath "$RUNNER_TEMP/export" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$ASC_KEY_PATH" \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID"
+
+      - name: Remove the App Store Connect key
+        if: always()
+        run: rm -f "$ASC_KEY_PATH"
