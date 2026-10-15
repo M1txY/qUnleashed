@@ -8,7 +8,7 @@ name: TestFlight (personal)
 #   Secrets   APPLE_TEAM_ID       10-character Team ID (developer.apple.com > Membership)
 #             ASC_KEY_ID          App Store Connect API key ID
 #             ASC_ISSUER_ID       App Store Connect API issuer ID
-#             ASC_KEY_P8_BASE64   the AuthKey_XXXX.p8 file, base64-encoded
+#             ASC_KEY_P8          the text of AuthKey_XXXX.p8, pasted as is
 #   Variable  IOS_BUNDLE_ID       a bundle ID registered on my account
 #
 # The key must have the Admin role: Xcode creates the distribution certificate
@@ -45,10 +45,10 @@ jobs:
     steps:
       - name: Check the signing inputs
         env:
-          ASC_KEY_P8_BASE64: ${{ secrets.ASC_KEY_P8_BASE64 }}
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
         run: |
           missing=0
-          for name in BUNDLE_ID TEAM_ID ASC_KEY_ID ASC_ISSUER_ID ASC_KEY_P8_BASE64; do
+          for name in BUNDLE_ID TEAM_ID ASC_KEY_ID ASC_ISSUER_ID ASC_KEY_P8; do
             if [ -z "${!name}" ]; then
               echo "::error::$name is not set. See the header of testflight.yml."
               missing=1
@@ -98,10 +98,10 @@ jobs:
 
       - name: Install the App Store Connect key
         env:
-          ASC_KEY_P8_BASE64: ${{ secrets.ASC_KEY_P8_BASE64 }}
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
         run: |
           mkdir -p "$(dirname "$ASC_KEY_PATH")"
-          printf '%s' "$ASC_KEY_P8_BASE64" | base64 --decode > "$ASC_KEY_PATH"
+          printf '%s\n' "$ASC_KEY_P8" > "$ASC_KEY_PATH"
           chmod 600 "$ASC_KEY_PATH"
 
       - name: Generate the Xcode configuration
